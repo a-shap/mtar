@@ -1,19 +1,18 @@
 CC?=gcc
 CFLAGS=-Wall -std=c99 -g
-LFLAGS=
-TARGET=libarchive.a
-AR=ar
 
-all: $(TARGET) mytar
+.PHONY: build clean test
 
-archive.o: archive.h archive.c
-	$(CC) $(CFLAGS) -c archive.c
+all: build
 
-$(TARGET): archive.o
-	$(AR) -r $(TARGET) archive.o
+build:
+	$(CC) $(CFLAGS) tar.c archive.c mytar.c -o mytar
 
-mytar: $(TARGET) mytar.c
-	$(CC) $(CFLAGS) mytar.c -o mytar -larchive -L.
+test:
+	mkdir -p test
+	./mytar c test/test.tar mytar.c
+	cd test; ../mytar x test.tar; cmp --silent mytar.c ../mytar.c || (echo "files are different" & exit 1)
 
 clean:
-	rm -f archive.o $(TARGET) ./mytar
+	rm -f ./mytar
+	rm -rf test

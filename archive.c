@@ -1,6 +1,87 @@
 #include "archive.h"
 
-int archive_write(const int fd, struct tar_t ** head, const size_t filecount, const char *files[])
+int archive_read(const int fd, struct ARCHIVE_P archive)
+{    
+    if (fd < 0)
+    {
+        printf("Bad file descriptor\n");
+        return -1;
+    }
+
+    unsigned int offset = 0;
+    int count = 0;
+
+    struct ARCHIVE_P entry = archive;
+    char update = 1;
+
+    for(count = 0; ; count++)
+    {
+        *entry = malloc(sizeof(struct archive_t));
+
+        if (update && (read_size(fd, (*entry)->block, BLOCKSIZE) != BLOCKSIZE))
+        {
+            printf("Could not read next block. IO error.\n");
+            archive_free(*entry);
+            *entry = NULL;
+            return -1;
+        }
+
+        update = 1;
+        // this block is all zeroes
+        if (check_zeroes((*entry)->block, BLOCKSIZE))
+        {
+            if (read_size(fd, (*entry)->block, BLOCKSIZE) != BLOCKSIZE)
+            {
+                printf("Could not read next block. IO error.\n");
+                archive_free(*entry);
+                *entry = NULL;
+                return -1;
+            }
+
+            // next one is too
+            if (check_zeroes((*entry)->block, BLOCKSIZE))
+            {
+                archive_free(*entry);
+                *entry = NULL;
+
+                // skip to end of record
+                if (lseek(fd, RECORDSIZE - (offset % RECORDSIZE), SEEK_CUR) == (off_t) (-1))
+                {
+                    printf("Can't seek file: %s \n", strerror(errno));
+                    return -1;
+                }
+
+                break;
+            }
+
+            update = 0;
+        }
+
+        // set current entry's file offset
+        (*entry)->begin = offset;
+
+        // skip over data and unfilled block
+        unsigned int jump = octal_to_uint((*entry)->size, 11);
+        if (jump % BLOCKSIZE)
+        {
+            jump += BLOCKSIZE - (jump % BLOCKSIZE);
+        }
+
+        // move fd
+        offset += BLOCKSIZE + jump;
+        if (lseek(fd, jump, SEEK_CUR) == (off_t) (-1))
+        {
+            printf("Can't seek file: %s \n", strerror(errno));
+            return -1;
+        }
+
+        entry = &((*entry)->next);
+    }
+
+    return count;
+}
+
+int archive_write(const int fd, struct ARCHIVE_P head, const size_t filecount, const char *files[])
 {
     if (fd < 0)
     {
@@ -9,7 +90,7 @@ int archive_write(const int fd, struct tar_t ** head, const size_t filecount, co
     }
 
     int offset = 0;
-    struct tar_t ** archive = head;
+    struct ARCHIVE_P archive = head;
 
     if (write_files(fd, archive, head, filecount, files, &offset) < 0)
     {
@@ -26,47 +107,44 @@ int archive_write(const int fd, struct tar_t ** head, const size_t filecount, co
     return offset;
 }
 
-void archive_free(struct tar_t * archive){
+void archive_free(struct ARCHIVE_ENTRY archive_entry)
+{
+    while (archive_entry)
+    {
+        struct ARCHIVE_ENTRY next = archive_entry->next;
+        free(archive_entry);
+        archive_entry = next;
+    }
+}
+
+int archive_extract(const int fd, struct ARCHIVE_ENTRY archive)
+{
+    if (archive_read(fd, &archive) < 0)
+    {
+        archive_free(archive);
+        close(fd);
+        return -1;
+    }
+
+    if (lseek(fd, 0, SEEK_SET) == (off_t) (-1)){
+        printf("Can't seek file: %s \n", strerror(errno));
+        return -1;
+    }
+
     while (archive)
     {
-        struct tar_t * next = archive -> next;
-        free(archive);
-        archive = next;
-    }
-}
-
-int read_size(int fd, char *buf, int size){
-    int got = 0, rc;
-    
-    while ((got < size) && ((rc = read(fd, buf + got, size - got)) > 0)){
-        got += rc;
-    }
-    
-    return got;
-}
-
-int write_size(int fd, char *buf, int size){
-    int wrote = 0, rc;
-    
-    while ((wrote < size) && ((rc = write(fd, buf + wrote, size - wrote)) > 0)){
-        wrote += rc;
-    }
-    
-    return wrote;
-}
-
-unsigned int oct2uint(char *oct, unsigned int size){
-    unsigned int out = 0;
-    int i = 0;
-    
-    while ((i < size) && oct[i]){
-        out = (out << 3) | (unsigned int) (oct[i++] - '0');
+        if (extract_file(fd, archive) < 0)
+        {
+            printf("Failed to extract file \n");
+            return -1;
+        }
+        archive = archive -> next;
     }
 
-    return out;
+    return 0;
 }
 
-int write_files(const int fd, struct tar_t **archive, struct tar_t **head, const size_t filecount, const char *files[], int *offset)
+int write_files(const int fd, struct ARCHIVE_P archive, struct ARCHIVE_P head, const size_t filecount, const char *files[], int *offset)
 {
     if (fd < 0)
     {
@@ -80,35 +158,37 @@ int write_files(const int fd, struct tar_t **archive, struct tar_t **head, const
         return -1;
     }
 
-    struct tar_t ** tar = archive;  // current entry
+    struct ARCHIVE_P entry = archive;
     
-    for(unsigned int i = 0; i < filecount; i++) {
-        *tar = malloc(sizeof(struct tar_t));
+    for(unsigned int i = 0; i < filecount; i++)
+    {
+        *entry = malloc(sizeof(struct archive_t));
 
-        if (make_tar_meta(*tar, files[i]) < 0)
+        if (make_tar_meta(*entry, files[i]) < 0)
         {
             printf("Could not create tar meta for %s\n", files[i]);
             return -1;
         }
 
-        (*tar)->begin = *offset;
+        (*entry)->begin = *offset;
 
-        printf("Writing %s\n", (*tar)->name);
+        printf("Writing %s\n", (*entry)->name);
 
         // write meta
-        if (write_size(fd, (*tar)->block, 512) != 512){
-            printf("Could not write tar meta for %s\n", (*tar)->name);
+        if (write_size(fd, (*entry)->block, 512) != 512)
+        {
+            printf("Could not write tar meta for %s\n", (*entry)->name);
             return -1;
         }
 
         // write supported file types
-        if (((*tar)->type == REGULAR) || ((*tar)->type == NORMAL) || ((*tar)->type == CONTIGUOUS))
+        if (((*entry)->type == REGULAR) || ((*entry)->type == NORMAL) || ((*entry)->type == CONTIGUOUS))
         {
-            int f = open((*tar)->name, O_RDONLY);
+            int f = open((*entry)->name, O_RDONLY);
         
             if (f < 0)
             {
-                printf("Could not open %s for reading\n", (*tar)->name);
+                printf("Could not open %s for reading\n", (*entry)->name);
                 return -1;
             }
 
@@ -127,11 +207,11 @@ int write_files(const int fd, struct tar_t **archive, struct tar_t **head, const
         }
         else
         {
-            printf("Skipping unsupported file type %s\n", (*tar)->name);
+            printf("Skipping unsupported file type %s\n", (*entry)->name);
         }
         
         // add padding
-        const unsigned int size = oct2uint((*tar) -> size, 11);
+        const unsigned int size = octal_to_uint((*entry)->size, 11);
         const unsigned int pad = 512 - size % 512;
         
         if (pad != 512)
@@ -148,7 +228,7 @@ int write_files(const int fd, struct tar_t **archive, struct tar_t **head, const
         }
 
         *offset += size;
-        tar = &((*tar)->next);
+        entry = &((*entry)->next);
 
         *offset += 512;
     }
@@ -192,85 +272,107 @@ int write_end(const int fd, int size)
     return pad;
 }
 
-int make_tar_meta(struct tar_t *entry, const char *filename)
-{   
-    struct stat st;
-    if (lstat(filename, &st))
+#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+
+int extract_file(const int fd, struct ARCHIVE_ENTRY entry)
+{
+    printf("Extracting %s\n", entry->name);
+
+    if ((entry->type == REGULAR) || (entry->type == NORMAL) || (entry->type == CONTIGUOUS))
     {
-        printf("Could not get file status %s: %s\n", filename, strerror(errno));
-        return -1;
+        size_t len = strlen(entry->name);
+        if (!len)
+        {
+            printf("Entry with an empty name detected, exiting.\n");
+            return -1;
+        }
+
+        // create file
+        const unsigned int size = octal_to_uint(entry->size, 11);
+        int f = open(entry->name, O_WRONLY | O_CREAT | O_TRUNC, octal_to_uint(entry->mode, 7) & 0777);
+        if (f < 0)
+        {
+            printf("Could not create file %s: %s\n", entry->name, strerror(errno));
+            return -1;
+        }
+
+        if (lseek(fd, 512 + entry->begin, SEEK_SET) == (off_t) (-1))
+        {
+            printf("Can't seek file: %s \n", strerror(errno));
+            return -1;
+        }
+
+        char buf[512];
+        int got = 0;
+        while (got < size)
+        {
+            int r;
+
+            if ((r = read_size(fd, buf, MIN(size - got, 512))) < 0)
+            {
+                printf("Can't read from archive: %s \n", strerror(errno));
+                return -1;
+            }
+
+            if (write(f, buf, r) != r)
+            {
+                printf("Can't write to %s: %s", entry->name, strerror(errno));
+                return -1;
+            }
+
+            got += r;
+        }
+
+        close(f);
     }
-
-    // handle relative path
-    int move = 0;
-    if (!strncmp(filename, "/", 1))
-        move = 1;
-    else if (!strncmp(filename, "./", 2))
-        move = 2;
-    else if (!strncmp(filename, "../", 3))
-        move = 3;
-
-    memset(entry, 0, sizeof(struct tar_t));
-    
-    // File meta
-    strncpy(entry->original_name, filename, 100);
-    strncpy(entry->name, filename + move, 100);
-    snprintf(entry->mode, sizeof(entry->mode), "%07o", st.st_mode & 0777);
-    snprintf(entry->uid, sizeof(entry->uid), "%07o", st.st_uid);
-    snprintf(entry->gid, sizeof(entry->gid), "%07o", st.st_gid);
-    snprintf(entry->size, sizeof(entry->size), "%011o", (int)st.st_size);
-    snprintf(entry->modtime, sizeof(entry->modtime), "%011o", (int)st.st_mtime);
-    
-    // "magick number"
-    memcpy(entry->ustar, "ustar  \x00", 8);
-
-    // File type
-    // @TODO only normal files supported
-    switch (st.st_mode & S_IFMT) {
-        case S_IFREG:
-            entry->type = NORMAL;
-            break;
-        default:
-            entry->type = -1;
-            printf("Unsupported file type found: %s\n", filename);
-            break;
-    }
-
-    // username
-    struct passwd pwd;
-    char buffer[4096];
-    struct passwd *result = NULL;
-    if (getpwuid_r(st.st_uid, &pwd, buffer, sizeof(buffer), &result))
-    {
-        printf("Unable to get username of uid %u: %s\n", st.st_uid, strerror(errno));
-    }
-
-    strncpy(entry->owner, buffer, sizeof(entry->owner) - 1);
-
-    // group name
-    struct group *grp = getgrgid(st.st_gid);
-    if (grp)
-    {
-        strncpy(entry->group, grp->gr_name, sizeof(entry->group) - 1);
-    }
-    else
-    {
-        strncpy(entry->group, "None", 4);
-    }
-    
-    // cheksum
-    memset(entry->check, ' ', 8);
-
-    unsigned int check = 0;
-    for(int i = 0; i < 512; i++)
-    {
-        check += (unsigned char) entry->block[i];
-    }
-
-    snprintf(entry->check, sizeof(entry->check), "%06o0", check);
-
-    entry->check[6] = '\0';
-    entry->check[7] = ' ';
-
     return 0;
+}
+
+int read_size(int fd, char *buf, int size)
+{
+    int got = 0, rc;
+    
+    while ((got < size) && ((rc = read(fd, buf + got, size - got)) > 0))
+    {
+        got += rc;
+    }
+    
+    return got;
+}
+
+int write_size(int fd, char *buf, int size)
+{
+    int wrote = 0, rc;
+    
+    while ((wrote < size) && ((rc = write(fd, buf + wrote, size - wrote)) > 0))
+    {
+        wrote += rc;
+    }
+    
+    return wrote;
+}
+
+unsigned int octal_to_uint(char *oct, unsigned int size)
+{
+    unsigned int out = 0;
+    int i = 0;
+    
+    while ((i < size) && oct[i])
+    {
+        out = (out << 3) | (unsigned int) (oct[i++] - '0');
+    }
+
+    return out;
+}
+
+int check_zeroes(char *buf, size_t size)
+{
+    for(size_t i = 0; i < size; buf++, i++)
+    {
+        if (*(char*)buf)
+        {
+            return 0;
+        }
+    }
+    return 1;
 }
